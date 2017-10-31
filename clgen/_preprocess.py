@@ -43,7 +43,6 @@ from typing import Dict, List, Tuple
 
 
 import clgen
-from clgen import clutil
 from clgen import dbutil
 from clgen import log
 from clgen import native
@@ -118,6 +117,13 @@ class RewriterException(UglyCodeException):
 class GPUVerifyException(UglyCodeException):
     """
     GPUVerify found a bug.
+    """
+    pass
+
+
+class GPUVerifyTimeoutException(GPUVerifyException):
+    """
+    GPUVerify timed out.
     """
     pass
 
@@ -305,7 +311,7 @@ def compile_cl_bytecode(src: str, id: str='anon', use_shim: bool=True) -> str:
     return stdout
 
 
-def gpuverify(src: str, args: list, id: str='anon') -> str:
+def gpuverify(src: str, args: list, id: str='anon', timeout=60) -> str:
     """
     Run GPUverify over kernel.
 
@@ -337,12 +343,14 @@ def gpuverify(src: str, args: list, id: str='anon') -> str:
     with NamedTemporaryFile('w', suffix='.cl') as tmp:
         tmp.write(src)
         tmp.flush()
-        cmd = [native.GPUVERIFY, tmp.name] + args
+        cmd = ['timeout', '-s9', str(timeout), native.GPUVERIFY, tmp.name] + args
 
         process = Popen(cmd, stdin=PIPE, stdout=PIPE, stderr=PIPE)
         stdout, stderr = process.communicate()
 
-    if process.returncode != 0:
+    if process.returncode == -9:  # timeout signal
+        raise GPUVerifyTimeoutException(f"GPUveryify failed to complete with {timeout} seconds")
+    elif process.returncode != 0:
         raise GPUVerifyException(stderr.decode('utf-8'))
 
     return src
@@ -606,8 +614,8 @@ def sanitize_prototype(src: str) -> str:
         return src
 
 
-def preprocess(src: str, id: str='anon', use_shim: bool=True,
-               use_gpuverify: bool=False) -> str:
+def preprocess_opencl(src: str, id: str='anon', use_shim: bool=True,
+                      use_gpuverify: bool=False) -> str:
     """
     Preprocess an OpenCL source. There are three possible outcomes:
 
@@ -657,6 +665,88 @@ def preprocess(src: str, id: str='anon', use_shim: bool=True,
         gpuverify(src)
 
     return src
+
+
+def _strip_comments(text: str):
+    """
+    Strip C/C++ style comments.
+
+    written by @markus-jarderot https://stackoverflow.com/a/241506/1318051
+    """
+    def replacer(match):
+        s = match.group(0)
+        if s.startswith('/'):
+            return " " # note: a space and not an empty string
+        else:
+            return s
+    pattern = re.compile(
+        r'//.*?$|/\*.*?\*/|\'(?:\\.|[^\\\'])*\'|"(?:\\.|[^\\"])*"',
+        re.DOTALL | re.MULTILINE
+    )
+    return re.sub(pattern, replacer, text)
+
+
+def _remove_duplicate_empty_lines(text: str):
+    """
+    Truncate blank lines.
+    """
+    last_line = None
+    lines = []
+    for line in text.split("\n"):
+        line = line.rstrip()
+        if line or last_line:
+            lines.append(line)
+        last_line = line
+    return "\n".join(lines)
+
+
+def preprocess_solidity(src: str, id: str='anon', **kwargs) -> str:
+    """
+    Preprocess a solidity source.
+    """
+    src = _strip_comments(src)
+    src = _remove_duplicate_empty_lines(src)
+    src = clangformat_ocl(src)
+    return src
+
+
+def preprocess(src: str, id: str="anon", lang: str="opencl",
+               **lang_opts) -> str:
+    """
+    Preprocess a file. There are three possible outcomes:
+
+    1. Good. Code is preprocessed and ready to be put into a training set.
+    2. Bad. Code can't be preprocessed (i.e. it's "bad" code).
+    3. Ugly. Code can be preprocessed but isn't useful for training
+       (e.g. it's an empty file).
+
+    Parameters
+    ----------
+    src : str
+        The source code as a string.
+    id : str, optional
+        An identifying name for the source code (used in exception messages).
+
+    Returns
+    -------
+    str
+        Preprocessed source code as a string.
+
+    Raises
+    ------
+    BadCodeException
+        If code is bad (see above).
+    UglyCodeException
+        If code is ugly (see above).
+    clgen.InternalException
+        In case of some other error.
+    """
+    if lang == "opencl":
+        return preprocess_opencl(src, id, **lang_opts)
+    elif lang == "solidity":
+        return preprocess_solidity(src, id, **lang_opts)
+    else:
+        raise ValueError(f"unsuporrted language '{lang}'")
 
 
 def preprocess_for_db(src: str, **preprocess_opts) -> Tuple[int, str]:
@@ -831,11 +921,23 @@ def _preprocess_db(db_path: str, max_num_workers: int=cpu_count(),
 
     log.verbose("creating jobs")
 
+    # Determine if we need to inline kernels when creating jobs
+    db = sqlite3.connect(db_path)
+    c = db.cursor()
+    c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ContentMeta';")
+    meta_table = c.fetchone()
+    c.close()
+    db.close()
+    if meta_table:
+        get_kernel = lambda kid: dbutil.get_inlined_kernel(db_path, kid, lang=preprocess_opts["lang"])
+    else:
+        get_kernel = lambda kid: dbutil.get_kernel(db_path, kid, table="ContentFiles")
+
     # create jobs
     jobs = [{
         "id": kid,
-        "src": dbutil.get_kernel(db_path, kid, "ContentFiles"),
-        "preprocess_opts": preprocess_opts
+        "src": get_kernel(kid),
+        "preprocess_opts": preprocess_opts,
     } for kid in todo]
 
     random.shuffle(jobs)

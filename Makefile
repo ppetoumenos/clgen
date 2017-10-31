@@ -35,6 +35,10 @@ distclean_targets =
 PYTHON ?= python3
 PIP ?= pip3
 
+# We are using $(llvm-config --cxxflags) to include LLVM headers, which outputs
+# clang-specific cflags, e.g. -fcolor-diagnostics.
+CXX := clang++
+
 # modules
 include make/remote.make
 include make/cmake.make
@@ -62,9 +66,12 @@ data_bin = \
 	$(root)/clgen/data/bin/clgen-features \
 	$(root)/clgen/data/bin/clgen-rewriter
 
-
 # build everything
-all: $(data_symlinks) $(data_bin)
+all install: $(data_symlinks) $(data_bin)
+	./configure -r >/dev/null
+	$(PIP) install --only-binary=numpy '$(shell grep numpy requirements.txt)'
+	$(PIP) install -r requirements.txt
+	$(PYTHON) ./setup.py install
 
 $(root)/clgen/data/bin/llvm-config: $(llvm)
 	mkdir -p $(dir $@)
@@ -114,7 +121,7 @@ $(root)/clgen/data/bin/clgen-rewriter: $(root)/native/clgen-rewriter.cpp $(data_
 
 # run tests
 .PHONY: test
-test: install
+test:
 	clgen test
 
 # clean compiled files
@@ -126,14 +133,6 @@ clean: $(clean_targets)
 .PHONY: distclean
 distclean: $(distclean_targets)
 	rm -f requirements.txt .config.json .config.make clgen/_config.py
-
-# install CLgen
-.PHONY: install
-install:
-	./configure -r >/dev/null
-	$(PIP) install --only-binary=numpy '$(shell grep numpy requirements.txt)'
-	$(PIP) install -r requirements.txt
-	$(PYTHON) ./setup.py install
 
 # autogenerate documentation
 .PHONY: docs-modules
@@ -171,7 +170,6 @@ docs: docs-modules
 .PHONY: help
 help:
 	@echo "make all        build CLgen"
-	@echo "make install    install CLgen"
 	@echo "make test       run test suite (requires install)"
 	@echo "make docs       build documentation (requires install)"
 	@echo "make clean      remove compiled files"

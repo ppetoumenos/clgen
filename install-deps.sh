@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# One-liner to install dependencies for CLgen 0.3.13.dev0.
+# One-liner to install dependencies for CLgen 0.4.0.dev0.
 #
 # Copyright 2016, 2017 Chris Cummins <chrisc.101@gmail.com>.
 #
@@ -46,7 +46,7 @@ elif [[ "$(uname)" == 'Linux' ]]; then
         sudo apt-get install -y build-essential git zlib1g-dev libffi-dev \
             zlib1g-dev curl wget python3-dev python3-pip python3-virtualenv \
             unzip libncurses5-dev libhdf5-dev python3.6 python3.6-venv \
-            python3.6-dev
+            python3.6-dev clang
 
     fi
 

@@ -39,6 +39,7 @@ import tarfile
 from collections import namedtuple
 from contextlib import contextmanager
 from copy import deepcopy
+from enum import Enum
 from hashlib import sha1
 from labm8 import cache
 from labm8 import fs
@@ -51,7 +52,7 @@ from clgen._config import *
 
 
 __author__ = "Chris Cummins"
-__copyright__ = "Copyright 2017, Chris Cummins"
+__copyright__ = "Copyright 2016, 2017 Chris Cummins"
 __license__ = "GPL v3"
 __version__ = require("clgen")[0].version
 __maintainer__ = __author__
@@ -71,15 +72,15 @@ version_info = version_info_t(_major, _minor, _micro, _releaselevel)
 
 class CLgenError(Exception):
     """
-    Module error.
+    Top level error. Never directly thrown.
     """
     pass
 
 
 class InternalError(CLgenError):
     """
-    An internal module error. This class of errors should not leak outside
-    of the module into user code.
+    An internal module error. This class of errors should not leak outside of
+    the module into user code.
     """
     pass
 
@@ -122,6 +123,30 @@ def version() -> str:
         Version string.
     """
     return __version__
+
+
+class Language(Enum):
+    OPENCL = 1
+    SOLIDITY = 2
+
+    @staticmethod
+    def from_str(string: str) -> 'Language':
+        if not string:
+            raise UserError(f"no language specified!")
+        lang = {
+            "opencl": Language.OPENCL,
+            "sol": Language.SOLIDITY,
+            "solidity": Language.SOLIDITY
+        }.get(string.lower(), None)
+        if not lang:
+            raise UserError(f"unknown language '{string}'")
+        return lang
+
+    def __str__(self):
+        return repr(self)
+
+    def __repr__(self):
+        return self.name.lower()
 
 
 def cachepath(*relative_path_components: list) -> str:
@@ -171,6 +196,8 @@ def mkcache(*relative_path_components: list) -> cache.FSCache:
 
     Parameters
     ----------
+    lang
+        Programming language.
     *relative_path_components
         Relative path of cache.
 

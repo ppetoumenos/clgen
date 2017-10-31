@@ -122,6 +122,11 @@ class SeqEncoder(clgen.CLgenObject):
 class Model(clgen.CLgenObject):
     """
     A CLgen Model.
+
+    Please note model instances should be treated as immutable. Upon
+    instantiation, a model's properties are used to determine its hash. If you
+    modify a property after instantiation, the hash will be out of date, which
+    can lead to bad things happening.
     """
     def __init__(self, corpus: clgen.Corpus, **opts):
         """
@@ -154,7 +159,7 @@ class Model(clgen.CLgenObject):
         self.opts = types.update(deepcopy(DEFAULT_MODEL_OPTS), opts)
         self.corpus = corpus
         self.hash = _hash(self.corpus, self.opts)
-        self.cache = clgen.mkcache("model", self.hash)
+        self.cache = clgen.mkcache("model", f"{corpus.language}-{self.hash}")
 
         log.debug("model", self.hash)
 

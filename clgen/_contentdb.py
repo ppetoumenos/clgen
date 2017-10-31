@@ -16,22 +16,20 @@
 # You should have received a copy of the GNU General Public License
 # along with CLgen.  If not, see <http://www.gnu.org/licenses/>.
 #
-from labm8 import fs
+"""
+CLgen sqlite3 database utilities
+"""
+import sqlalchemy as sql
+
+from pathlib import Path
 
 import clgen
-from clgen import test as tests
+from clgen import log
 
 
-def test_explore():
-    c = clgen.Corpus.from_json({
-        "language": "opencl",
-        "path": tests.data_path("tiny", "corpus", exists=False)
-    })
-    clgen.explore(c.contentcache["kernels.db"])
+class ContentDb(object):
+    def __init__(self, path: Path, github: bool=False):
+        raise NotImplementedError
 
-
-def test_explore_gh():
-    db_path = tests.archive("tiny-gh.db")
-    assert(fs.exists(db_path))
-
-    clgen.explore(db_path)
+    def session(self):
+        raise NotImplementedError

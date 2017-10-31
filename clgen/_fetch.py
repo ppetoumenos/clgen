@@ -38,7 +38,6 @@ from time import sleep
 from typing import List
 
 import clgen
-from clgen import clutil
 from clgen import dbutil
 from clgen import log
 
@@ -160,12 +159,13 @@ def _process_repo(g, db, repo) -> bool:
 
 
 _include_re = re.compile('\w*#include ["<](.*)[">]')
+_sol_include_re = re.compile('\w*import ["<](\./)?(.*)[">];')
 
 
-def _download_file(github_token: str, repo, url: str, stack: List[str]) -> str:
+def _download_opencl_file(github_token: str, repo, url: str,
+                          stack: List[str]) -> str:
     """
     Fetch file from GitHub.
-
     Recursively downloads and inlines headers.
 
     Parameters
@@ -213,7 +213,8 @@ def _download_file(github_token: str, repo, url: str, stack: List[str]) -> str:
                     break
 
             if include_url and include_url not in stack:
-                include_src = _download_file(github_token, repo, include_url)
+                include_src = _download_opencl_file(
+                    github_token, repo, include_url)
                 outlines.append(include_src)
             else:
                 if not include_url:
@@ -226,7 +227,35 @@ def _download_file(github_token: str, repo, url: str, stack: List[str]) -> str:
     return '\n'.join(outlines)
 
 
-def _process_file(g, github_token: str, db, repo, file) -> bool:
+def _download_file(github_token: str, repo, url: str) -> str:
+    """
+    Fetch file from GitHub.
+
+    Parameters
+    ----------
+    github_token : str
+        Authorization.
+    repo
+        Repository.
+    url : str
+        Path.
+
+    Returns
+    -------
+    str
+        File contents.
+    """
+    response = json.loads(requests.get(
+        url,
+        headers={
+            'Authorization': 'token ' + str(github_token)
+        }
+    ).content.decode('utf-8'))
+    return b64decode(response['content']).decode('utf-8')
+
+
+def _process_file(g, github_token: str, db, repo, file,
+                  download_file_cb) -> bool:
     """
     GitHub file handler.
 
@@ -253,10 +282,6 @@ def _process_file(g, github_token: str, db, repo, file) -> bool:
     global files_unchanged_counter
     global status_string
 
-    # We're only interested in OpenCL files.
-    if not (file.path.endswith('.cl') or path.endswith('.ocl')):
-        return
-
     url = file.url
     sha = file.sha
     path = file.path
@@ -273,7 +298,7 @@ def _process_file(g, github_token: str, db, repo, file) -> bool:
         return False
 
     repo_url = repo.url
-    contents = _download_file(github_token, repo, file.url, [])
+    contents = download_file_cb(github_token, repo, file.url)
     size = file.size
 
     c.execute("DELETE FROM ContentFiles WHERE id=?", (url,))
@@ -292,14 +317,67 @@ def _process_file(g, github_token: str, db, repo, file) -> bool:
     return True
 
 
-def fetch_github(db_path: str, github_username: str, github_pw: str,
-                 github_token: str) -> None:
-    """
-    Download all of the OpenCL on GitHub (!)
+def _scrape_github_for_files(db_path: str, github_username: str,
+                             github_pw: str, github_token: str,
+                             query_terms: List[str], file_is_intetesting,
+                             download_file_cb):
+    global errors_counter
 
-    Shortcomings of this appraoch:
-        * Only includes exclusively OpenCL files, no inline strings.
-        * Occasionally (< 1%) can't find headers to include.
+    g = Github(github_username, github_pw)
+    db = dbutil.connect(db_path)
+
+    if not dbutil.is_github:
+        raise clgen.UserError("not a GitHub database")
+
+    # fetch the repositories to iterate over
+    for query in query_terms:
+        # forks are okay - we use checksums to ensure uniqueness in
+        # final dataset
+        repos = g.search_repositories(query + ' fork:true sort:stars')
+
+        for repo in repos:
+            # do nothing unless the repo is new or modified
+            if not _process_repo(g, db, repo):
+                continue
+
+            # iterate over the entire git tree of the repo's default branch
+            # (usually 'master'). If a file ends with the .cl extension, check
+            # to see if we already have it, else download it
+            try:
+                branch = repo.default_branch
+                tree_iterator = repo.get_git_tree(branch, recursive=True).tree
+                for f in tree_iterator:
+                    if file_is_intetesting(f):
+                        try:
+                            _process_file(g, github_token, db, repo, f,
+                                          download_file_cb)
+                        except Exception as e:
+                            print(e)
+                            sys.exit(1)
+                            errors_counter += 1
+            except GithubException:
+                # do nothing in case of error (such as an empty repo)
+                pass
+
+    _print_counters()
+    print("\n\ndone.")
+    db.close()
+
+
+def is_opencl_path(file) -> bool:
+    """ We're only interested in OpenCL files. """
+    return file.path.endswith('.cl') or file.path.endswith('.ocl')
+
+
+def is_solidity_path(file) -> bool:
+    """ We're only interesting in Solidity files. """
+    return file.path.endswith('.sol')
+
+
+def fetch_github(db_path: str, github_username: str, github_pw: str,
+                 github_token: str, lang: str="opencl") -> None:
+    """
+    Download all of the Solidity on GitHub (!)
 
     Parameters
     ----------
@@ -312,64 +390,35 @@ def fetch_github(db_path: str, github_username: str, github_pw: str,
     github_token : str
         Authorization.
     """
-    global errors_counter
+    if lang == "opencl":
+        download_file_cb = _download_opencl_file
+        file_is_intetesting = is_opencl_path
+        query_terms = [
+            'opencl',
+            'cl',
+            'khronos',
+            'gpu',
+            'gpgpu',
+            'cuda',
+            'amd',
+            'nvidia',
+            'heterogeneous'
+        ]
+    elif lang == "solidity":
+        download_file_cb = _download_file
+        file_is_intetesting = is_solidity_path
+        query_terms = [
+            'solidity',
+            'ethereum',
+            'solc',
+        ]
+    else:
+        raise ValueError(f"unsupported language '{lang}'")
 
-    g = Github(github_username, github_pw)
-    db = dbutil.connect(db_path)
-
-    if not dbutil.is_github:
-        raise clgen.UserError("not a GitHub database")
-
-    handle_repo = partial(_process_repo, g, db)
-
-    # fetch the repositories to iterate over. Since opencl isn't
-    # treated as a first-class language by GitHub, we can't use the
-    # 'language=' keyword for queries, so instead we through a much
-    # wider net and filter the results afterwards.
-    query_terms = [
-        'opencl',
-        'cl',
-        'khronos',
-        'gpu',
-        'gpgpu',
-        'cuda',
-        'amd',
-        'nvidia',
-        'heterogeneous'
-    ]
-    for query in query_terms:
-        # forks are okay - we use checksums to ensure uniqueness in
-        # final dataset
-        repos = g.search_repositories(query + ' fork:true sort:stars')
-
-        for repo in repos:
-            repo_modified = handle_repo(repo)
-
-            # do nothing unless the repo is new or modified
-            if not repo_modified:
-                continue
-
-            handle_file = partial(_process_file, g, github_token, db, repo)
-
-            # iterate over the entire git tree of the repo's default
-            # branch (usually 'master'). If a file ends with the .cl
-            # extension, check to see if we already have it, else download
-            # it
-            try:
-                branch = repo.default_branch
-                tree_iterator = repo.get_git_tree(branch, recursive=True).tree
-                for f in tree_iterator:
-                    try:
-                        handle_file(f)
-                    except Exception:
-                        errors_counter += 1
-            except GithubException:
-                # do nothing in case of error (such as an empty repo)
-                pass
-
-    _print_counters()
-    print("\n\ndone.")
-    db.close()
+    return _scrape_github_for_files(db_path, github_username, github_pw,
+                                    github_token, query_terms,
+                                    file_is_intetesting,
+                                    download_file_cb)
 
 
 def inline_fs_headers(path: str, stack: List[str]) -> str:

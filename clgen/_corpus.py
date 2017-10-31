@@ -32,6 +32,7 @@ from labm8 import fs
 from labm8 import jsonutil
 from labm8 import lockfile
 from labm8 import prof
+from labm8 import text
 from labm8 import tar
 from labm8 import types
 from labm8.dirhashcache import DirHashCache
@@ -59,7 +60,9 @@ DEFAULT_CORPUS_OPTS = {
     "seq_length": 50,
     "vocabulary": "char",
     "encoding": "default",
+    "preprocess": True,
     "preserve_order": False,
+    "language": None,   # Note no explicit default language.
 }
 
 
@@ -133,6 +136,76 @@ def get_kernel_features(code: str, **kwargs) -> np.array:
     return f[0]
 
 
+def get_cl_kernel_end_idx(src: str, start_idx: int=0, max_len: int=5000) -> int:
+    """
+    Return the index of the character after the end of the OpenCL
+    kernel.
+
+    Parameters
+    ----------
+    src : str
+        OpenCL source.
+    start_idx : int, optional
+        Start index.
+    max_len : int, optional
+        Maximum kernel length.
+
+    Returns
+    -------
+    int
+        Index of end of OpenCL kernel.
+    """
+    i = src.find('{', start_idx) + 1
+    d = 1  # depth
+    while i < min(len(src), start_idx + max_len) and d > 0:
+        if src[i] == '{':
+            d += 1
+        elif src[i] == '}':
+            d -= 1
+        i += 1
+    return i
+
+
+def get_cl_kernel(src: str, start_idx: int, max_len: int=5000) -> str:
+    """
+    Return the OpenCL kernel.
+
+    Parameters
+    ----------
+    src : str
+        OpenCL source.
+    start_idx : int, optional
+        Start index.
+    max_len : int, optional
+        Maximum kernel length.
+
+    Returns
+    -------
+    str
+        OpenCL kernel.
+    """
+    return src[start_idx:get_cl_kernel_end_idx(src, start_idx)]
+
+
+def get_cl_kernels(src: str) -> List[str]:
+    """
+    Return OpenCL kernels.
+
+    Parameters
+    ----------
+    src : str
+        OpenCL source.
+
+    Returns
+    -------
+    List[str]
+        OpenCL kernels.
+    """
+    idxs = text.get_substring_idxs('__kernel', src)
+    kernels = [get_cl_kernel(src, i) for i in idxs]
+    return kernels
+
+
 def encode_kernels_db(kernels_db: str, encoding: str) -> None:
     """
     Encode a kernels database.
@@ -155,7 +228,7 @@ def encode_kernels_db(kernels_db: str, encoding: str) -> None:
         for row in list(c.fetchall()):
             id, contents = row
             c.execute("DELETE FROM PreprocessedFiles WHERE id=?", (id,))
-            for i, kernel in enumerate(clutil.get_cl_kernels(contents)):
+            for i, kernel in enumerate(get_cl_kernels(contents)):
                 features = get_kernel_features(kernel)
                 kid = "{}-{}".format(id, i)
                 if len(features) == 8:
@@ -204,6 +277,11 @@ def add_noise(x, unk) -> np.array:
 class Corpus(clgen.CLgenObject):
     """
     Representation of a training corpus.
+
+    Please note corpus instances should be treated as immutable. Upon
+    instantiation, a corpus's properties are used to determine its hash. If you
+    modify a property after instantiation, the hash will be out of date, which
+    can lead to bad things happening.
     """
     def __init__(self, contentid: str, path: str=None, **opts):
         """
@@ -233,17 +311,18 @@ class Corpus(clgen.CLgenObject):
         self.opts["id"] = contentid
 
         # check that contentid exists
+        self.language = clgen.Language.from_str(opts.get("language"))
         if (path is None and
-            not fs.isdir(clgen.cachepath("contentfiles", contentid))):
-            raise clgen.UserError("corpus {contentid} not found"
+            not fs.isdir(clgen.cachepath("contentfiles", f"{self.language}-{contentid}"))):
+            raise clgen.UserError("corpus {self.language}-{contentid} not found"
                                   .format(**vars()))
 
         self.contentid = contentid
-        self.contentcache = clgen.mkcache("contentfiles", contentid)
+        self.contentcache = clgen.mkcache("contentfiles", f"{self.language}-{contentid}")
         self.kernels_db = self.contentcache.keypath('kernels.db')
 
         self.hash = self._hash(contentid, self.opts)
-        self.cache = clgen.mkcache("corpus", self.hash)
+        self.cache = clgen.mkcache("corpus", f"{self.language}-{self.hash}")
 
         log.debug("contentfiles {self.contentid}".format(**vars()))
         log.debug("corpus {hash}".format(hash=self.hash))
@@ -304,7 +383,8 @@ class Corpus(clgen.CLgenObject):
             modified = False
             preprocess_time = time()
             encoding = self.opts["encoding"]
-            if clgen.preprocess_db(self.contentcache["kernels.db"]):
+            if clgen.preprocess_db(self.contentcache["kernels.db"],
+                                   lang=str(self.language)):
                 modified = True
                 encode_kernels_db(self.contentcache["kernels.db"], encoding)
         except Exception as e:
@@ -656,43 +736,6 @@ class Corpus(clgen.CLgenObject):
         for row in query.fetchall():
             yield row[0]
 
-    def most_common_prototypes(self, n: int) -> Tuple[List[Tuple[float, str]], int]:
-        """
-        Return the n most frequently occuring prototypes.
-
-        Parameters
-        ----------
-        c : Corpus
-            Corpus.
-        n : int
-            Number of prototypes to return:
-
-        Returns
-        -------
-        Tuple[List[Tuple[float, str]], int]
-            Tuple of list of prototypes, and the number of prototypes.
-        """
-        from clgen import clutil
-
-        prototypes = []
-        for kernel in self.preprocessed():
-            try:
-                prototype = clutil.KernelPrototype.from_source(kernel)
-                if prototype.is_synthesizable:
-                    prototypes.append(", ".join(str(x) for x in prototype.args))
-            except clutil.PrototypeException:
-                pass
-
-        # Convert frequency into ratios
-        counter = Counter(prototypes)
-        results = []
-        for row in counter.most_common(n):
-            prototype, freq = row
-            ratio = freq / len(prototypes)
-            results.append((ratio, prototype))
-
-        return results, len(prototypes)
-
     def __repr__(self) -> str:
         nf = dbutil.num_good_kernels(self.contentcache['kernels.db'])
         return (f"corpus[{self.shorthash}]: {nf} files, {self.size} tokens " +
@@ -730,6 +773,7 @@ class Corpus(clgen.CLgenObject):
         """
         path = corpus_json.pop("path", None)
         uid = corpus_json.pop("id", None)
+        language = clgen.Language.from_str(corpus_json.get("language"))
 
         if path:
             path = unpack_directory_if_needed(fs.abspath(path))
@@ -740,7 +784,7 @@ class Corpus(clgen.CLgenObject):
             dirhashcache = DirHashCache(clgen.cachepath("dirhash.db"), 'sha1')
             uid = prof.profile(dirhashcache.dirhash, path)
         elif uid:
-            cache_path = clgen.mkcache("contentfiles", uid).path
+            cache_path = clgen.mkcache("contentfiles", f"{language}-{uid}").path
             if not fs.isdir(cache_path):
                 raise clgen.UserError("Corpus content {} not found".format(uid))
         else:
