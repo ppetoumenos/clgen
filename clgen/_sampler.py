@@ -119,15 +119,21 @@ class SampleProducer(Thread):
 
             saver.restore(sess, ckpt.model_checkpoint_path)
 
-            def weighted_pick(weights, temperature):
+            def weighted_pick(weights, temperature, vocab_size):
                 """
                 requires that all probabilities are >= 0, i.e.:
                   assert all(x >= 0 for x in weights)
                 See: https://github.com/ChrisCummins/clgen/issues/120
                 """
+                #assert(all(x >= 0 for x in weights))
+                weights += weights.min()
                 t = np.cumsum(weights)
                 s = np.sum(weights)
-                return int(np.searchsorted(t, np.random.rand(1) * s))
+                for _ in range(10):
+                    pick = int(np.searchsorted(t, np.random.rand(1) * s))
+                    if pick < vocab_size:
+                        return pick
+                raise clgen.InternalError("Weighted pick kept selecting invalid character")
 
             def update_bracket_depth(text, started: bool=False, depth: int=0):
                 """ calculate function block depth """
@@ -146,13 +152,23 @@ class SampleProducer(Thread):
                 buf = StringIO()
                 started, depth = init_started, init_depth
 
-                state = sess.run(model.cell.zero_state(1, tf.float32))
+                x = np.zeros((1, 1))
+                l = np.zeros((1,))
+                w = np.zeros((1, 1), dtype=np.float32)
+                x[0, 0] = model.corpus.atomizer.vocab['__GO__']
+                w[0, 0] = 1.0
+                l[0] = 1
+
+                mean = np.random.rand(1, 32)
+                logvar = np.full((1, 32), -800.0, dtype=np.float32)
+
+                feed = {model.dec_inp: x, model.tweights: w, model.mean_latent: mean, model.logvar_latent: logvar, model.lens: l}
+                [state] = sess.run([model.final_state], feed)
 
                 seed_tensor = model.corpus.atomizer.atomize(self.start_text)
                 for index in seed_tensor[:-1]:
-                    x = np.zeros((1, 1))
                     x[0, 0] = index
-                    feed = {model.input_data: x, model.initial_state: state}
+                    feed = {model.dec_inp: x, model.tweights: w, model.decoder_initial_state: state, model.lens: l}
                     [state] = sess.run([model.final_state], feed)
 
                 buf.write(self.start_text)
@@ -164,19 +180,17 @@ class SampleProducer(Thread):
                 index = seed_tensor[-1]
 
                 for _ in range(max_length):
-                    x = np.zeros((1, 1))
                     x[0, 0] = index
-                    feed = {model.input_data: x, model.initial_state: state}
-                    [probs, state] = sess.run([model.probs, model.final_state],
-                                              feed)
+                    feed = {model.dec_inp: x, model.tweights: w, model.decoder_initial_state: state, model.lens: l}
+                    [probs, state] = sess.run([model.probs, model.final_state], feed)
                     p = probs[0]
 
                     # sample distribution to pick next:
-                    index = weighted_pick(p, temperature)
+                    index = weighted_pick(p, temperature, model.corpus.atomizer.vocab_size)
                     # alternatively, select most probable:
                     # index = np.argmax(p)
 
-                    atom = model.corpus.atomizer.deatomize([index])
+                    atom = model.corpus.atomizer.deatomize(np.array([index]))
                     buf.write(atom)
                     if log.is_verbose():
                         sys.stdout.write(atom)

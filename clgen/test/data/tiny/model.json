@@ -7,11 +7,13 @@
     "path": "corpus",  # directory containing kernel files
     "preserve_order": false,  # if false, shuffle kernels during training
     "eof": false,  # if True, insert markers between kernels during training
-    "vocabulary": "char"  # encoding type {"char","greedy"}
+    "vocabulary": "char",  # encoding type {"char","greedy"}
+    "batch_size": 64,
+    "seq_length": 512
   },
   "architecture": {
     "model_type": "lstm",  # {"lstm","rnn","gru"}
-    "rnn_size": 128,  # num nodes per layer, int
+    "rnn_size": 256,  # num nodes per layer, int
     "num_layers": 2
   },
   "train_opts": {

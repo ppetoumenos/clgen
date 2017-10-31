@@ -193,6 +193,13 @@ def encode_kernels_db(kernels_db: str, encoding: str) -> None:
     else:
         encoder(kernels_db)
 
+def add_noise(x, unk) -> np.array:
+    """Adds Unknown atoms in the x numpy array. A form of dropout"""
+    noise = np.full(x.shape, unk, dtype=np.int32)
+    keep = np.random.uniform(size=x.shape) < 0.62
+    no_keep = np.invert(keep)
+    return np.select([keep, no_keep], [x, noise])
+
 
 class Corpus(clgen.CLgenObject):
     """
@@ -388,6 +395,7 @@ class Corpus(clgen.CLgenObject):
                 "char": clgen.CharacterAtomizer,
                 "greedy": clgen.GreedyAtomizer,
             }
+            self.vocab_type = vocab
             atomizerclass = atomizers.get(vocab, None)
             if atomizerclass is None:
                 raise clgen.UserError(
@@ -431,43 +439,110 @@ class Corpus(clgen.CLgenObject):
         c.execute("SELECT PreprocessedFiles.Contents FROM PreprocessedFiles "
                   "WHERE status=0 ORDER BY {orderby}".format(orderby=orderby))
 
-        # If file separators are requested, insert EOF markers between files
-        sep = '\n\n// EOF\n\n' if self.opts["eof"] else '\n\n'
+        return [row[0] for row in c.fetchall()]
 
-        return sep.join(row[0] for row in c.fetchall())
-
-    def create_batches(self) -> None:
-        """
-        Create batches for training.
-        """
-        self.reset_batch_pointer()
-
-        # generate a kernel corpus
+    def create_data(self) -> None:
+        """create a numpy array with all the training data"""
         data = self._generate_kernel_corpus()
-
-        # encode corpus into vocab indices
-        self._tensor = self.atomizer.atomize(data)
-
-        batch_size = self.batch_size
         seq_length = self.seq_length
+        batch_size = self.batch_size
+        pad = self.atomizer.vocab['__PAD__']
 
+        lst_x = []
+        lst_w = []
+        lst_l = []
+
+        inps = [self.atomizer.atomize(kernel.strip()) for kernel in data]
+
+        def next_sequence(inp, length):
+            """ produce the next sequence out of the input array """
+            x = np.full((seq_length,), pad, dtype=np.int32)
+            weights = np.ones((seq_length,), dtype=np.int32)
+            actual_length = 0
+
+            if length >= seq_length:
+                x[:seq_length] = inp[:seq_length]
+                actual_length = seq_length
+            else:
+                x[:length] = inp
+                actual_length = length + 1
+                if length <= seq_length - 2:
+                    weights[length + 1:] = 0
+            return x, weights, actual_length
+
+        for inp in inps:
+            length = np.shape(inp)[0]
+            while length > 16:
+                x, weights, actual_length = next_sequence(inp, length)
+                lst_x.append(x)
+                lst_w.append(weights)
+                lst_l.append(actual_length)
+
+                inp = inp[actual_length:]
+                length = length - actual_length
+
+            
+        num_examples = len(lst_x)
         # set corpus size and number of batches
-        self._size = len(self._tensor)
-        self._num_batches = int(self.size / (batch_size * seq_length))
+        self._size = num_examples * seq_length
+        self._num_batches = int(num_examples / batch_size)
         if self.num_batches == 0:
             raise clgen.UserError(
                 "Not enough data. Use a smaller seq_length and batch_size")
 
+        self.tensor_x = np.array(lst_x)
+        self.tensor_w = np.array(lst_w)
+        self.tensor_l = np.array(lst_l)
+
+    def create_batches(self) -> None:
+        """
+        Create batches for training with features and
+        with each kernel a separate sequence
+        """
+
+        try:
+            a = self.tensor_x
+        except AttributeError:
+            self.create_data()
+            
+        self.reset_batch_pointer()
+
+        num_examples = len(self.tensor_x)
+        # shuffle
+        if not self.opts["preserve_order"]:
+            p = np.random.permutation(num_examples)
+            self.tensor_x = self.tensor_x[p]
+            self.tensor_w = self.tensor_w[p]
+            self.tensor_l = self.tensor_l[p]
+
+        pad = self.atomizer.vocab['__PAD__']
+        go = self.atomizer.vocab['__GO__']
+        eos = self.atomizer.vocab['__EOS__']
+        unk = self.atomizer.vocab['__UNK__']
+
+        # create encoder input, decoder input, and decoder output out of tensor_x
+        tensor_x_enc = np.zeros((num_examples, self.seq_length), dtype=np.int32)    
+        tensor_x_enc.fill(pad)
+
+        tensor_x_dec = np.zeros((num_examples, self.seq_length), dtype=np.int32)    
+        tensor_x_dec.fill(pad)
+        tensor_x_dec[0] = go
+
+        noisy_x = add_noise(self.tensor_x, unk)
+        for idx in range(num_examples):
+            tensor_x_dec[idx, 1:self.tensor_l[idx]] = noisy_x[idx, :self.tensor_l[idx] - 1]
+            tensor_x_enc[idx,] = self.tensor_x[idx,]
+            if self.tensor_l[idx] < self.seq_length:
+                tensor_x_enc[idx, self.tensor_l[idx] - 1] = eos
+
+        used_examples = self._num_batches * self.batch_size
+
         # split into batches
-        self._tensor = self._tensor[:self.num_batches * batch_size * seq_length]
-        xdata = self._tensor
-        ydata = np.copy(self._tensor)
-        ydata[:-1] = xdata[1:]
-        ydata[-1] = xdata[0]
-        self._x_batches = np.split(xdata.reshape(batch_size, -1),
-                                   self.num_batches, 1)
-        self._y_batches = np.split(ydata.reshape(batch_size, -1),
-                                   self.num_batches, 1)
+        self._x_enc_batches = np.split(tensor_x_enc[:used_examples], self.num_batches)
+        self._x_dec_batches = np.split(tensor_x_dec[:used_examples], self.num_batches)
+        self._w_batches = np.split(self.tensor_w[:used_examples], self.num_batches)
+        self._l_batches = np.split(self.tensor_l[:used_examples], self.num_batches)
+
 
     @property
     def shorthash(self):
@@ -511,19 +586,27 @@ class Corpus(clgen.CLgenObject):
         """
         self._pointer = 0
 
-    def next_batch(self) -> Tuple[np.array, np.array]:
+    def next_batch(self) -> Tuple[np.array, np.array, np.array, np.array]:
         """
         Fetch next batch indices.
 
         Returns
         -------
-        Tuple[np.array, np.array]
-            X, Y batch tuple.
+        Tuple[np.array, np.array, np.array, np.array]
+            Encoder input, Decoder input, Weights, lengths batch tuple.
         """
-        x = self._x_batches[self._pointer]
-        y = self._y_batches[self._pointer]
+        try:
+            if self._pointer >= self.num_batches:
+                self.create_batches()
+        except AttributeError:
+            self.create_batches()
+
+        x_enc = self._x_enc_batches[self._pointer]
+        x_dec = self._x_dec_batches[self._pointer]
+        w = self._w_batches[self._pointer]
+        l = self._l_batches[self._pointer]
         self._pointer += 1
-        return x, y
+        return x_enc, x_dec, w, l
 
     def set_batch_pointer(self, pointer: int) -> None:
         """

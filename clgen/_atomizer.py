@@ -27,6 +27,12 @@ from typing import Dict, List
 
 import clgen
 
+# Meta tokens
+META_ATOMS = set([
+    '__PAD__',
+    '__GO__',
+    '__EOS__',
+    '__UNK__'])
 
 # Taken from the C99 spec, OpenCL spec 1.2, and bag-of-words analysis of
 # GitHub corpus:
@@ -243,6 +249,10 @@ class Atomizer(clgen.CLgenObject):
         str
             Decoded text.
         """
+        for atom in META_ATOMS:
+            idx = self.vocab[atom]
+            encoded = encoded[encoded != idx]
+
         try:
             return ''.join(list(map(lambda x: self.decoder[x], encoded)))
         except KeyError:
@@ -360,7 +370,7 @@ class GreedyAtomizer(Atomizer):
         return "GreedyAtomizer[{n} tokens]".format(n=self.vocab_size)
 
     @staticmethod
-    def from_text(text: str, atoms=OPENCL_ATOMS) -> 'GreedyAtomizer':
+    def from_text(text: str, atoms=(OPENCL_ATOMS | META_ATOMS)) -> 'GreedyAtomizer':
         # Instantiate a greedy atomizer using the full vocabulary.
         full_vocab = dict(zip(atoms, range(len(atoms))))
         c = GreedyAtomizer(full_vocab, determine_chars=True)
@@ -369,6 +379,12 @@ class GreedyAtomizer(Atomizer):
         # text.
         tokens = sorted(list(set(c.tokenize(text))))
         vocab_subset = dict(zip(tokens, range(len(tokens))))
+	
+        # Special atoms need to be always in the vocab
+        for atom in META_ATOMS:
+            if atom not in vocab_subset:
+                maxind = max(vocab_subset.values())
+                vocab_subset[atom] = maxind + 1
 
         # Return a new atomizer using the subset vocabulary.
         return GreedyAtomizer(vocab_subset)

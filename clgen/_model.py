@@ -24,6 +24,7 @@ import progressbar
 import re
 import sys
 import tarfile
+import threading
 
 from copy import deepcopy
 from datetime import datetime
@@ -38,6 +39,12 @@ from typing import Iterator, List, Union
 
 import clgen
 from clgen import log
+import tensorflow as tf
+from tensorflow.python.util import nest
+from tensorflow.contrib import rnn
+from tensorflow.python.layers.core import Dense
+import tensorflow.contrib.seq2seq as seq2seq
+
 
 
 # Default options used for model. Any values provided by the user will override
@@ -68,6 +75,48 @@ class ModelError(clgen.CLgenError):
     Module level error
     """
     pass
+
+def get_cell(model_type):
+    cell_fn = {
+        "lstm": rnn.BasicLSTMCell,
+        "gru": rnn.GRUCell,
+        "rnn": rnn.BasicRNNCell
+    }.get(model_type, None)
+    if cell_fn is None:
+        raise clgen.UserError("Unrecognized model type")
+    return cell_fn
+
+
+class SeqEncoder(clgen.CLgenObject):
+    """
+    The encoder Part of the model
+    """
+    def __init__(self, model_type, rnn_size, num_layers, batch_size, vocab_size):
+        self.cell_fn = get_cell(model_type)
+        self.rnn_size = rnn_size
+        self.num_layers = num_layers
+        self.batch_size = batch_size
+        self.vocab_size = vocab_size
+
+    def encode(self, inputs, lengths):
+        cells_lst = [self.cell_fn(self.rnn_size, state_is_tuple=True) for _ in range(self.num_layers)]
+        cell = rnn.MultiRNNCell(cells_lst, state_is_tuple=True)
+
+        self.initial_state = cell.zero_state(self.batch_size, tf.float32)
+
+        with tf.variable_scope('encoder'):
+            with tf.device('/cpu:0'):
+                # Inputs 
+                embedding = tf.get_variable('embedding', [self.vocab_size, self.rnn_size])
+                inp = tf.nn.embedding_lookup(embedding, inputs)
+
+            _, output_state = tf.nn.dynamic_rnn(cell, inp,
+                sequence_length = lengths,
+                initial_state = self.initial_state,
+                dtype = tf.float32, swap_memory = True,
+                time_major = False)
+
+        return output_state
 
 
 class Model(clgen.CLgenObject):
@@ -167,10 +216,6 @@ class Model(clgen.CLgenObject):
         # quiet tensorflow. See: https://github.com/tensorflow/tensorflow/issues/1258
         os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
-        import tensorflow as tf
-        import tensorflow.contrib.legacy_seq2seq as seq2seq
-        from tensorflow.contrib import rnn
-
         self.cell_fn = {
             "lstm": rnn.BasicLSTMCell,
             "gru": rnn.GRUCell,
@@ -187,61 +232,70 @@ class Model(clgen.CLgenObject):
         seq_length = 1 if infer else self.corpus.seq_length
         vocab_size = self.corpus.vocab_size
 
-        cell = self.cell_fn(self.rnn_size, state_is_tuple=True)
-        self.cell = cell = rnn.MultiRNNCell(
-            [cell] * self.num_layers, state_is_tuple=True)
-        self.input_data = tf.placeholder(tf.int32, [batch_size, seq_length])
-        self.targets = tf.placeholder(tf.int32, [batch_size, seq_length])
-        self.initial_state = self.cell.zero_state(batch_size, tf.float32)
+        cells_lst = [self.cell_fn(self.rnn_size, state_is_tuple=True) for _ in range(self.num_layers)]
+        self.cell = rnn.MultiRNNCell(cells_lst, state_is_tuple=True)
+
+        with tf.device("/cpu:0"):
+            # Inputs 
+            self.encoder_input = tf.placeholder(tf.int32, [batch_size, seq_length])
+            self.decoder_input = tf.placeholder(tf.int32, [batch_size, seq_length])
+            self.target_weights = tf.placeholder(tf.int32, [batch_size, seq_length])
+            self.lengths = tf.placeholder(tf.int32, [batch_size])
+
+            self.q = tf.FIFOQueue(capacity=4,
+                dtypes=[tf.int32, tf.int32, tf.int32, tf.int32],
+                shapes=[tf.TensorShape([batch_size, seq_length]), 
+                    tf.TensorShape([batch_size, seq_length]),
+                    tf.TensorShape([batch_size, seq_length]),
+                    tf.TensorShape([batch_size])])
+            self.enqueue_op = self.q.enqueue((self.encoder_input, self.decoder_input, self.target_weights, self.lengths))
+
+            next_example = self.q.dequeue()
+
+            self.inputs = next_example[0]
+            self.dec_inp = next_example[1]
+            self.tweights = tf.to_float(next_example[2])
+            self.lens = next_example[3]
+        
 
         scope_name = 'rnnlm'
         with tf.variable_scope(scope_name):
-            softmax_w = tf.get_variable("softmax_w",
-                                        [self.rnn_size, vocab_size])
+            softmax_w = tf.get_variable("softmax_w", [self.rnn_size, vocab_size])
             softmax_b = tf.get_variable("softmax_b", [vocab_size])
 
             with tf.device("/cpu:0"):
-                embedding = tf.get_variable("embedding",
-                                            [vocab_size, self.rnn_size])
-                inputs = tf.split(
-                    axis=1, num_or_size_splits=seq_length,
-                    value=tf.nn.embedding_lookup(embedding, self.input_data))
-                inputs = [tf.squeeze(input_, [1]) for input_ in inputs]
+                embedding_dec = tf.get_variable("embedding_dec", [vocab_size, self.rnn_size])
+                dec_inp2 = tf.nn.embedding_lookup(embedding_dec, self.dec_inp)
 
-        def loop(prev, _):
-            prev = tf.matmul(prev, softmax_w) + softmax_b
-            prev_symbol = tf.stop_gradient(tf.argmax(prev, 1))
-            return tf.nn.embedding_lookup(embedding, prev_symbol)
+        encoder = SeqEncoder(self.model_type, self.rnn_size, self.num_layers, batch_size, vocab_size)
+        encoder_state = encoder.encode(self.inputs, self.lens)
 
-        outputs, last_state = seq2seq.rnn_decoder(
-            inputs, self.initial_state, cell,
-            loop_function=loop if infer else None, scope=scope_name)
-        output = tf.reshape(tf.concat(axis=1, values=outputs), [-1, self.rnn_size])
-        self.logits = tf.matmul(output, softmax_w) + softmax_b
-        self.probs = tf.nn.softmax(self.logits)
-        loss = seq2seq.sequence_loss_by_example(
-            [self.logits],
-            [tf.reshape(self.targets, [-1])],
-            [tf.ones([batch_size * seq_length])],
-            vocab_size)
-        self.cost = tf.reduce_sum(loss) / batch_size / seq_length
-        self.final_state = last_state
+        self.mean_latent, self.logvar_latent = encoder_to_latent(encoder_state, self.rnn_size, 32, self.num_layers, tf.float32)
+        self.latent, self.KL_obj, self.KL_cost = sample(self.mean_latent, self.logvar_latent, 32)
+        self.decoder_initial_state = latent_to_decoder(self.latent, self.rnn_size, 32, self.num_layers, tf.float32)
+
+
+        decoder_initial_state2 = tuple([rnn.LSTMStateTuple(*single_layer_state) for single_layer_state in self.decoder_initial_state])
+
+        helper = seq2seq.TrainingHelper(dec_inp2, self.lens, time_major=False)
+        decoder = seq2seq.BasicDecoder(self.cell, helper, decoder_initial_state2, Dense(vocab_size))
+        self.final_outputs, self.final_state = seq2seq.dynamic_decode(decoder, output_time_major=False, impute_finished=True, swap_memory=True, scope='rnnlm')
+
+        self.final_out = self.final_outputs.rnn_output
+
+        self.probs = tf.nn.softmax(self.final_out)
+        self.cost = seq2seq.sequence_loss(self.final_out, self.inputs, self.tweights)
+
         self.learning_rate = tf.Variable(0.0, trainable=False)
         self.epoch = tf.Variable(0, trainable=False)
         tvars = tf.trainable_variables()
         grads, _ = tf.clip_by_global_norm(
-            # Argument of potential interest:
-            #   aggregation_method=tf.AggregationMethod.EXPERIMENTAL_TREE
-            #
-            # See:
-            #   https://www.tensorflow.org/api_docs/python/tf/gradients
-            #   https://www.tensorflow.org/api_docs/python/tf/AggregationMethod
-            tf.gradients(self.cost, tvars
-        ), self.grad_clip)
+            tf.gradients(self.cost + self.KL_obj, tvars, aggregation_method = 2), self.grad_clip)
         optimizer = tf.train.AdamOptimizer(self.learning_rate)
         self.train_op = optimizer.apply_gradients(zip(grads, tvars))
 
         return tf
+
 
     def _get_params_path(self, ckpt) -> str:
         """ return path to checkpoint closest to target num of epochs """
@@ -260,6 +314,12 @@ class Model(clgen.CLgenObject):
                 closest_path = path
 
         return closest_path, paths
+
+    def enqueue_x(self, coord, sess):
+        with coord.stop_on_exception():
+            while not coord.should_stop():
+                x_enc, x_dec, w, l = self.corpus.next_batch()
+                sess.run(self.enqueue_op, feed_dict={self.encoder_input: x_enc, self.decoder_input: x_dec, self.target_weights: w, self.lengths: l})
 
     def _locked_train(self) -> 'Model':
         tf = self._init_tensorflow(infer=False)
@@ -294,6 +354,10 @@ class Model(clgen.CLgenObject):
             if ckpt_paths:
                 saver.recover_last_checkpoints(ckpt_paths)
 
+            coord = tf.train.Coordinator()
+            self.corpus.create_batches()
+            threading.Thread(target=self.enqueue_x, args=(coord, sess)).start()
+
             max_batch = self.epochs * self.corpus.num_batches
 
             # progress bar
@@ -311,18 +375,8 @@ class Model(clgen.CLgenObject):
                 sess.run(tf.assign(self.learning_rate, new_learning_rate))
                 sess.run(tf.assign(self.epoch, e))
 
-                self.corpus.create_batches()
-
-                state = sess.run(self.initial_state)
                 for b in range(self.corpus.num_batches):
-                    x, y = self.corpus.next_batch()
-                    feed = {self.input_data: x, self.targets: y}
-                    for i, (c, h) in enumerate(self.initial_state):
-                        feed[c] = state[i].c
-                        feed[h] = state[i].h
-                    train_cost, state, _ = sess.run(
-                        [self.cost, self.final_state, self.train_op], feed)
-
+                    train_cost, _, state, _ = sess.run([self.cost, self.KL_cost, self.final_state, self.train_op])
                     # update progress bar
                     batch_num = (e - 1) * self.corpus.num_batches + b
                     bar.update(batch_num)
@@ -345,7 +399,7 @@ class Model(clgen.CLgenObject):
                     self.stats["epoch_times"].append(epoch_duration)
                     self.stats["epoch_batches"].append(batch_num + 1)
                     self._flush_meta()
-
+            coord.request_stop()
         return self
 
     def _flush_meta(self) -> None:
@@ -541,3 +595,45 @@ def models_to_tab(*models: List[Model]) -> PrettyTable:
         ])
 
     return tab
+
+def encoder_to_latent(encoder_state,
+                      rnn_size,
+                      latent_dim,
+                      num_layers,
+                      dtype=None):
+    concat_state_size = num_layers * rnn_size * 2
+    encoder_state = list(map(lambda state_tuple: tf.concat(state_tuple, axis=1), encoder_state))
+    encoder_state = tf.concat(encoder_state, axis=1)
+    with tf.variable_scope('encoder_to_latent'):
+        w = tf.get_variable("w",[concat_state_size, 2 * latent_dim], dtype=dtype)
+        b = tf.get_variable("b", [2 * latent_dim], dtype=dtype)
+        mean_logvar = tf.nn.relu(tf.matmul(encoder_state, w) + b)
+        mean, logvar = tf.split(mean_logvar, 2, 1)
+
+    return mean, logvar
+
+
+def latent_to_decoder(latent_vector,
+                      rnn_size,
+                      latent_dim,
+                      num_layers,
+                      dtype=None):
+
+    concat_state_size = num_layers * rnn_size * 2
+    with tf.variable_scope('latent_to_decoder'):
+        w = tf.get_variable("w", [latent_dim, concat_state_size], dtype=dtype)
+        b = tf.get_variable("b", [concat_state_size], dtype=dtype)
+        decoder_initial_state = tf.nn.relu(tf.matmul(latent_vector, w) + b)
+        decoder_initial_state = tuple(tf.split(decoder_initial_state, num_layers, 1))
+        decoder_initial_state = tuple([tuple(tf.split(single_layer_state, 2, 1)) for single_layer_state in decoder_initial_state])
+
+    return decoder_initial_state
+
+def sample(means, logvars, latent_dim):
+    noise = tf.random_normal(tf.shape(means))
+    sample = means + tf.exp(0.5 * logvars) * noise
+    kl_cost = -0.5 * (logvars - tf.square(means) - tf.exp(logvars) + 1.0)
+    kl_ave = tf.reduce_mean(kl_cost, [0]) #mean of kl_cost over batches
+    kl_obj = kl_cost = tf.reduce_sum(kl_ave)
+
+    return sample, kl_obj, kl_cost #both kl_obj and kl_cost are scalar
